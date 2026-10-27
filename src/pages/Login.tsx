@@ -16,10 +16,14 @@ export default function Login() {
     const { data, error } =
       mode === "signin"
         ? await supabase.auth.signInWithPassword({ email, password })
-        : await supabase.auth.signUp({ email, password, options: { data: { name, role: "teacher" } } });
+        : await supabase.auth.signUp({
+            email,
+            password,
+            options: { data: { name, role: "teacher" }, emailRedirectTo: window.location.origin },
+          });
     setBusy(false);
     if (error) setMessage(error.message);
-    else if (mode === "signup" && !data.session) setMessage("Conta criada! Confirme pelo link enviado ao seu e-mail.");
+    else if (mode === "signup" && !data.session) setMessage("Conta criada! Abra o link enviado ao seu e-mail e depois volte aqui para entrar.");
   }
 
   return (

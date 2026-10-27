@@ -298,3 +298,11 @@ create policy "teacher updates own audio" on storage.objects
 create policy "teacher deletes own audio" on storage.objects
   for delete to authenticated
   using (bucket_id = 'lesson-audio' and (storage.foldername(name))[1] = (select auth.uid())::text);
+
+-- Helpers das policies: só para usuários logados (respondem apenas sobre o próprio usuário).
+revoke all on function public.is_teacher() from public, anon;
+revoke all on function public.owns_course(uuid) from public, anon;
+revoke all on function public.is_enrolled(uuid) from public, anon;
+grant execute on function public.is_teacher() to authenticated;
+grant execute on function public.owns_course(uuid) to authenticated;
+grant execute on function public.is_enrolled(uuid) to authenticated;

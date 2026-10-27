@@ -81,9 +81,10 @@ interface ChunkRow {
   issues: ReviewIssue[] | null;
 }
 
-const client = new Anthropic({ apiKey: env("ANTHROPIC_API_KEY") });
+let client: Anthropic | null = null;
 
 async function reviewChunk(title: string, chunk: ChunkRow, total: number): Promise<ChunkReview> {
+  client ??= new Anthropic({ apiKey: env("ANTHROPIC_API_KEY") });
   const response = await client.beta.messages.create({
     model: MODEL,
     max_tokens: 16000,

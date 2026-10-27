@@ -15,7 +15,7 @@ export function json(body: unknown, status = 200): Response {
 
 export function env(name: string): string {
   const value = Deno.env.get(name);
-  if (!value) throw new Error(`Variável de ambiente ausente: ${name}`);
+  if (!value) throw new Error(`Chave ${name} não configurada (Supabase > Edge Functions > Secrets).`);
   return value;
 }
 
