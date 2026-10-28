@@ -9,6 +9,8 @@ import { FeedbackGuard } from "./feedbackGuard";
  */
 export interface MicEngineEvents {
   onFeedback?: (frequencyHz: number, newVolume: number) => void;
+  /** Estado do áudio mudou (ex.: iOS suspendeu ao trocar de rota/receber ligação). */
+  onStateChange?: (state: string) => void;
 }
 
 type SinkCapable = { setSinkId?: (id: string) => Promise<void> };
@@ -33,23 +35,77 @@ export class MicEngine {
   private timeBuf = new Float32Array(0);
   private freqBuf = new Float32Array(0);
   private volume = 0.8;
+  private graphReady = false;
 
   constructor(private readonly events: MicEngineEvents = {}) {}
 
   get running(): boolean {
-    return this.ctx !== null;
+    return this.graphReady;
+  }
+
+  /** "running" quando o som está saindo; "suspended"/"interrupted" quando o navegador travou o áudio. */
+  get audioState(): string {
+    return this.ctx?.state ?? "closed";
+  }
+
+  /** Dados para a tela de diagnóstico. */
+  get diagnostics(): { state: string; sampleRate: number; latencyMs: number; input: string } {
+    const ctx = this.ctx;
+    const latency = ctx ? (ctx.baseLatency || 0) + ((ctx as AudioContext & { outputLatency?: number }).outputLatency || 0) : 0;
+    return {
+      state: this.audioState,
+      sampleRate: ctx?.sampleRate ?? 0,
+      latencyMs: Math.round(latency * 1000),
+      input: this.stream?.getAudioTracks()[0]?.label ?? "",
+    };
+  }
+
+  /**
+   * Cria/destrava o áudio. Precisa ser chamado de forma SÍNCRONA dentro do toque do usuário:
+   * o iOS só libera o som se o AudioContext for retomado no próprio gesto, antes de qualquer await.
+   */
+  unlock(): void {
+    if (!this.ctx) {
+      this.ctx = new AudioContext({ latencyHint: "interactive" });
+      this.ctx.onstatechange = () => this.events.onStateChange?.(this.audioState);
+    }
+    void this.ctx.resume();
+  }
+
+  /** Tenta retomar o áudio (chamar a partir de um toque). */
+  async resume(): Promise<string> {
+    this.unlock();
+    await this.ctx!.resume().catch(() => undefined);
+    return this.audioState;
+  }
+
+  /** Toca um bipe curto na saída (sem passar pelo microfone) para testar a caixa de som. */
+  playTestTone(): void {
+    this.unlock();
+    const ctx = this.ctx!;
+    const target = this.graphReady ? this.volumeGain : ctx.destination;
+    const osc = new OscillatorNode(ctx, { type: "sine", frequency: 660 });
+    const env = new GainNode(ctx, { gain: 0 });
+    const t = ctx.currentTime;
+    env.gain.setValueAtTime(0, t);
+    env.gain.linearRampToValueAtTime(0.5, t + 0.03);
+    env.gain.setValueAtTime(0.5, t + 0.5);
+    env.gain.linearRampToValueAtTime(0, t + 0.6);
+    osc.connect(env).connect(target);
+    osc.start(t);
+    osc.stop(t + 0.65);
   }
 
   /** Stream processado para o MediaRecorder. */
   get recordingStream(): MediaStream {
-    if (!this.ctx) throw new Error("Microfone não iniciado");
+    if (!this.graphReady) throw new Error("Microfone não iniciado");
     return this.recordDest.stream;
   }
 
   async start(inputId?: string, outputId?: string): Promise<void> {
-    if (this.ctx) return;
-    const ctx = new AudioContext({ latencyHint: "interactive" });
-    this.ctx = ctx;
+    if (this.graphReady) return;
+    this.unlock();
+    const ctx = this.ctx!;
 
     this.highpass = new BiquadFilterNode(ctx, { type: "highpass", frequency: 90, Q: 0.7 });
     this.compressor = new DynamicsCompressorNode(ctx, {
@@ -72,10 +128,11 @@ export class MicEngine {
     this.timeBuf = new Float32Array(this.analyser.fftSize);
     this.freqBuf = new Float32Array(this.analyser.frequencyBinCount);
     this.guard = new FeedbackGuard({ sampleRate: ctx.sampleRate, fftSize: this.analyser.fftSize });
+    this.graphReady = true;
 
     await this.setInput(inputId);
     if (outputId) await this.setOutput(outputId);
-    if (ctx.state === "suspended") await ctx.resume();
+    if (ctx.state !== "running") await ctx.resume().catch(() => undefined);
     this.guardTimer = window.setInterval(() => this.checkFeedback(), 50);
   }
 
@@ -133,7 +190,7 @@ export class MicEngine {
 
   setVolume(volume: number): void {
     this.volume = Math.min(1.5, Math.max(0, volume));
-    if (this.ctx) this.volumeGain.gain.setTargetAtTime(this.volume, this.ctx.currentTime, 0.02);
+    if (this.graphReady && this.ctx) this.volumeGain.gain.setTargetAtTime(this.volume, this.ctx.currentTime, 0.02);
   }
 
   getVolume(): number {
@@ -141,12 +198,12 @@ export class MicEngine {
   }
 
   setMuted(muted: boolean): void {
-    if (this.ctx) this.muteGain.gain.setTargetAtTime(muted ? 0 : 1, this.ctx.currentTime, 0.01);
+    if (this.graphReady && this.ctx) this.muteGain.gain.setTargetAtTime(muted ? 0 : 1, this.ctx.currentTime, 0.01);
   }
 
   /** Nível de entrada de 0 a 1 para o medidor. */
   getLevel(): number {
-    if (!this.ctx) return 0;
+    if (!this.graphReady) return 0;
     this.analyser.getFloatTimeDomainData(this.timeBuf);
     let sum = 0;
     for (const v of this.timeBuf) sum += v * v;
@@ -156,7 +213,7 @@ export class MicEngine {
   }
 
   private checkFeedback(): void {
-    if (!this.ctx) return;
+    if (!this.graphReady) return;
     this.analyser.getFloatFrequencyData(this.freqBuf);
     const result = this.guard.analyze(this.freqBuf, performance.now());
     if (!result.feedback || result.frequencyHz === null) return;
@@ -174,6 +231,7 @@ export class MicEngine {
     this.fallbackEl?.pause();
     await this.ctx?.close();
     this.ctx = null;
+    this.graphReady = false;
     this.stream = null;
     this.source = null;
     this.fallbackDest = null;

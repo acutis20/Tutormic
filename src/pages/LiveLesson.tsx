@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { MicEngine } from "../audio/micEngine";
 import { SegmentedRecorder } from "../audio/recorder";
-import { canSelectOutput, ensureMicPermission, looksExternal, watchDevices, type AudioDevices } from "../audio/devices";
+import { canSelectOutput, listAudioDevices, looksExternal, watchDevices, type AudioDevices } from "../audio/devices";
 import { getLesson, getRecordingResume, updateLesson, type Lesson } from "../lib/api";
 import { onQueueChange, uploadQueue } from "../lib/queue";
 import LevelMeter from "../components/LevelMeter";
@@ -10,6 +10,9 @@ import DevicePicker from "../components/DevicePicker";
 import BigMuteButton from "../components/BigMuteButton";
 
 type Phase = "idle" | "starting" | "live" | "ending";
+
+const IS_IOS =
+  /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
 
 function formatElapsed(s: number): string {
   const h = Math.floor(s / 3600);
@@ -34,6 +37,8 @@ export default function LiveLesson() {
   const [alert, setAlert] = useState<string | null>(null);
   const [suggested, setSuggested] = useState<MediaDeviceInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [audioState, setAudioState] = useState("closed");
+  const [diag, setDiag] = useState<MicEngine["diagnostics"] | null>(null);
 
   const engineRef = useRef<MicEngine | null>(null);
   const recorderRef = useRef<SegmentedRecorder | null>(null);
@@ -49,6 +54,7 @@ export default function LiveLesson() {
           `Microfonia detectada (~${Math.round(hz)} Hz). Abaixei o volume. Afaste o celular/microfone da caixa de som.`,
         );
       },
+      onStateChange: setAudioState,
     });
   }
   const engine = engineRef.current;
@@ -75,9 +81,13 @@ export default function LiveLesson() {
 
   useEffect(() => {
     if (phase !== "live") return;
-    const t = window.setInterval(() => setElapsed(recorderRef.current?.elapsedS ?? 0), 500);
+    const t = window.setInterval(() => {
+      setElapsed(recorderRef.current?.elapsedS ?? 0);
+      setAudioState(engine.audioState);
+      setDiag(engine.diagnostics);
+    }, 500);
     return () => window.clearInterval(t);
-  }, [phase]);
+  }, [phase, engine]);
 
   // Ao sair da página, desliga tudo (a gravação já salva fica na fila).
   useEffect(
@@ -101,12 +111,16 @@ export default function LiveLesson() {
   }, []);
 
   async function start() {
+    // Primeiro, ainda dentro do toque: o iOS só libera o som assim.
+    engine.unlock();
     setPhase("starting");
     setError(null);
     try {
-      await ensureMicPermission();
       await engine.start(inputId || undefined, outputId !== "default" ? outputId : undefined);
       engine.setVolume(volume);
+      setAudioState(engine.audioState);
+      // Depois da permissão os nomes dos dispositivos aparecem.
+      void listAudioDevices().then(setDevices);
 
       const queued = await uploadQueue.items(lessonId);
       const resume = await getRecordingResume(lessonId, queued);
@@ -151,6 +165,17 @@ export default function LiveLesson() {
       const ok = await engine.setOutput(id).catch(() => false);
       if (!ok) setError("Este navegador não permite escolher a saída. Use a saída de áudio do sistema.");
     }
+  }
+
+  async function reactivateSound() {
+    const state = await engine.resume();
+    setAudioState(state);
+    if (state !== "running") setError("O navegador ainda bloqueou o som. Feche outros apps de áudio e toque de novo.");
+  }
+
+  function testSound() {
+    engine.playTestTone();
+    setAudioState(engine.audioState);
   }
 
   function toggleMute() {
@@ -202,6 +227,16 @@ export default function LiveLesson() {
         </button>
       )}
 
+      {phase === "live" && audioState !== "running" && (
+        <button
+          onClick={reactivateSound}
+          className="rounded-2xl bg-amber-400 p-4 text-lg font-bold text-slate-950"
+          data-testid="reactivate-sound"
+        >
+          🔊 O som está pausado. Toque aqui para ativar
+        </button>
+      )}
+
       {suggested && (
         <div className="rounded-xl bg-sky-500/15 p-3 text-sm">
           Novo microfone conectado: <b>{suggested.label}</b>
@@ -220,6 +255,7 @@ export default function LiveLesson() {
         <div className="flex flex-col items-center gap-5">
           <BigMuteButton muted={muted} onToggle={toggleMute} />
           <LevelMeter getLevel={getLevel} active={phase === "live" && !muted} />
+          <p className="-mt-3 text-xs text-slate-500">Se a barra se mexe quando você fala, o microfone está captando.</p>
           <label className="w-full">
             <span className="mb-1 flex justify-between text-sm text-slate-400">
               <span>Volume na caixa</span>
@@ -255,6 +291,16 @@ export default function LiveLesson() {
             Saída: a do sistema. Pareie a JBL nas configurações de Bluetooth do aparelho antes de começar.
           </p>
         )}
+        <button onClick={testSound} disabled={phase === "ending"} className="w-full rounded-lg bg-slate-800 p-3 text-sm">
+          🔔 Testar som da caixa (toca um bipe)
+        </button>
+        {IS_IOS && (
+          <p className="rounded-lg bg-amber-500/10 p-3 text-xs text-amber-200">
+            iPhone/iPad: com o microfone ligado, o iOS às vezes manda o som para o alto-falante do próprio aparelho em vez
+            do Bluetooth. Se o bipe sai na caixa/TV mas sua voz não, é essa limitação do iOS. Nesse caso use cabo
+            (adaptador P2) ou abra o TutorMic num notebook ou celular Android.
+          </p>
+        )}
         <details className="text-sm text-slate-400">
           <summary className="cursor-pointer">Dicas para um som melhor</summary>
           <ul className="mt-2 list-disc space-y-1 pl-5">
@@ -262,8 +308,20 @@ export default function LiveLesson() {
             <li>O Bluetooth tem um pequeno atraso (0,15–0,3 s). Se a caixa tiver entrada P2/AUX, o cabo é melhor.</li>
             <li>Mantenha o microfone longe e atrás da caixa para evitar microfonia (apito).</li>
             <li>Deixe a tela ligada com o app aberto durante a aula.</li>
+            <li>TVs costumam ter mais atraso no Bluetooth que caixas de som (pode passar de meio segundo).</li>
           </ul>
         </details>
+        {diag && (
+          <details className="text-xs text-slate-500" data-testid="diagnostics">
+            <summary className="cursor-pointer">Diagnóstico</summary>
+            <ul className="mt-2 space-y-0.5 font-mono">
+              <li>áudio: {diag.state === "running" ? "ativo ✅" : `${diag.state} ⚠️`}</li>
+              <li>microfone: {diag.input || "?"}</li>
+              <li>taxa: {diag.sampleRate} Hz · latência do sistema: {diag.latencyMs} ms</li>
+              <li>navegador: {IS_IOS ? "iOS" : navigator.userAgent.includes("Android") ? "Android" : "computador"}</li>
+            </ul>
+          </details>
+        )}
       </section>
 
       {pending > 0 && <p className="text-center text-xs text-slate-500">Enviando áudio: {pending} parte(s) na fila</p>}
