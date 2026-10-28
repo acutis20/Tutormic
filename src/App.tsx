@@ -7,6 +7,7 @@ import Login from "./pages/Login";
 import Dashboard from "./pages/Dashboard";
 import LiveLesson from "./pages/LiveLesson";
 import LessonReview from "./pages/LessonReview";
+import Receiver from "./pages/Receiver";
 
 export default function App() {
   const [session, setSession] = useState<Session | null | undefined>(undefined);
@@ -38,6 +39,8 @@ export default function App() {
   return (
     <BrowserRouter>
       <Routes>
+        <Route path="/receptor" element={<Receiver />} />
+        <Route path="/receptor/:code" element={<Receiver />} />
         {session ? (
           <>
             <Route path="/" element={<Dashboard />} />

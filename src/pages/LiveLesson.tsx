@@ -1,18 +1,35 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { MicEngine } from "../audio/micEngine";
 import { SegmentedRecorder } from "../audio/recorder";
 import { canSelectOutput, listAudioDevices, looksExternal, watchDevices, type AudioDevices } from "../audio/devices";
 import { getLesson, getRecordingResume, updateLesson, type Lesson } from "../lib/api";
 import { onQueueChange, uploadQueue } from "../lib/queue";
+import { createRoomCode, MicTransmitter } from "../live/relay";
 import LevelMeter from "../components/LevelMeter";
 import DevicePicker from "../components/DevicePicker";
 import BigMuteButton from "../components/BigMuteButton";
 
 type Phase = "idle" | "starting" | "live" | "ending";
+/** local: o som sai neste aparelho. remote: sai em outro aparelho (receptor) ligado à caixa. */
+type OutputMode = "local" | "remote";
 
 const IS_IOS =
   /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
+/** Mesmo código de receptor durante toda a aula, mesmo se o app for reaberto. */
+function roomCodeFor(lessonId: string): string {
+  const key = `tutormic-room-${lessonId}`;
+  try {
+    const saved = localStorage.getItem(key);
+    if (saved) return saved;
+    const code = createRoomCode();
+    localStorage.setItem(key, code);
+    return code;
+  } catch {
+    return createRoomCode();
+  }
+}
 
 function formatElapsed(s: number): string {
   const h = Math.floor(s / 3600);
@@ -39,6 +56,12 @@ export default function LiveLesson() {
   const [error, setError] = useState<string | null>(null);
   const [audioState, setAudioState] = useState("closed");
   const [diag, setDiag] = useState<MicEngine["diagnostics"] | null>(null);
+  // No iPhone/iPad o som não sai no Bluetooth com o microfone ligado: começa no modo receptor.
+  const [outputMode, setOutputMode] = useState<OutputMode>(IS_IOS ? "remote" : "local");
+  const [listeners, setListeners] = useState(0);
+  const roomCode = useMemo(() => roomCodeFor(lessonId), [lessonId]);
+  const receiverUrl = `${location.origin}/receptor/${roomCode}${location.search.includes("signal=local") ? "?signal=local" : ""}`;
+  const transmitterRef = useRef<MicTransmitter | null>(null);
 
   const engineRef = useRef<MicEngine | null>(null);
   const recorderRef = useRef<SegmentedRecorder | null>(null);
@@ -89,9 +112,28 @@ export default function LiveLesson() {
     return () => window.clearInterval(t);
   }, [phase, engine]);
 
+  // Modo receptor: transmite o som para os aparelhos ligados à caixa.
+  useEffect(() => {
+    engine.setLocalOutput(outputMode === "local");
+    if (phase !== "live" || outputMode !== "remote") {
+      transmitterRef.current?.stop();
+      transmitterRef.current = null;
+      setListeners(0);
+      return;
+    }
+    const transmitter = new MicTransmitter(roomCode, engine.liveStream, setListeners);
+    transmitterRef.current = transmitter;
+    transmitter.start().catch((e: Error) => setError(e.message));
+    return () => {
+      transmitter.stop();
+      if (transmitterRef.current === transmitter) transmitterRef.current = null;
+    };
+  }, [phase, outputMode, roomCode, engine]);
+
   // Ao sair da página, desliga tudo (a gravação já salva fica na fila).
   useEffect(
     () => () => {
+      transmitterRef.current?.stop();
       void recorderRef.current?.stop();
       void engine.stop();
       void wakeLockRef.current?.release();
@@ -113,6 +155,7 @@ export default function LiveLesson() {
   async function start() {
     // Primeiro, ainda dentro do toque: o iOS só libera o som assim.
     engine.unlock();
+    engine.setLocalOutput(outputMode === "local");
     setPhase("starting");
     setError(null);
     try {
@@ -190,6 +233,8 @@ export default function LiveLesson() {
 
   async function end() {
     setPhase("ending");
+    transmitterRef.current?.stop();
+    transmitterRef.current = null;
     await recorderRef.current?.stop();
     recorderRef.current = null;
     await engine.stop();
@@ -282,9 +327,53 @@ export default function LiveLesson() {
         </button>
       )}
 
+      <section className="space-y-3 rounded-2xl bg-slate-900 p-4" data-testid="output-mode">
+        <span className="block text-sm text-slate-400">Onde o som sai</span>
+        <div className="grid grid-cols-2 gap-2">
+          {(
+            [
+              ["local", "📱 Neste aparelho", "Bluetooth ou cabo deste aparelho"],
+              ["remote", "🔈 Em outro aparelho", "PC, notebook ou Android ligado à caixa"],
+            ] as const
+          ).map(([mode, title, hint]) => (
+            <button
+              key={mode}
+              onClick={() => setOutputMode(mode)}
+              disabled={phase === "ending"}
+              aria-pressed={outputMode === mode}
+              className={`rounded-xl p-3 text-left ${outputMode === mode ? "bg-sky-500 text-slate-950" : "bg-slate-800"}`}
+            >
+              <span className="block font-semibold">{title}</span>
+              <span className="text-xs opacity-75">{hint}</span>
+            </button>
+          ))}
+        </div>
+
+        {outputMode === "remote" && (
+          <div className="rounded-xl bg-slate-800 p-4 text-center">
+            <p className="text-sm text-slate-400">No aparelho ligado à caixa de som, abra</p>
+            <p className="font-semibold break-all">{location.host}/receptor</p>
+            <p className="mt-2 text-sm text-slate-400">e digite o código</p>
+            <p className="font-mono text-4xl font-bold tracking-[0.3em]" data-testid="room-code-display">
+              {roomCode}
+            </p>
+            <a href={receiverUrl} target="_blank" rel="noreferrer" className="mt-2 inline-block text-xs text-sky-300 underline">
+              {receiverUrl.replace(/^https?:\/\//, "")}
+            </a>
+            <p className={`mt-3 text-sm ${listeners ? "text-emerald-300" : "text-slate-400"}`} data-testid="listeners">
+              {phase !== "live"
+                ? "O som começa a ir para o receptor quando você ligar o microfone."
+                : listeners
+                  ? `🔈 ${listeners} receptor${listeners > 1 ? "es" : ""} tocando`
+                  : "Aguardando um receptor conectar…"}
+            </p>
+          </div>
+        )}
+      </section>
+
       <section className="space-y-3 rounded-2xl bg-slate-900 p-4">
         <DevicePicker label="Microfone" devices={devices.inputs} value={inputId} onChange={changeInput} disabled={phase === "ending"} />
-        {outputSelectable ? (
+        {outputMode === "remote" ? null : outputSelectable ? (
           <DevicePicker label="Saída (caixa de som)" devices={devices.outputs} value={outputId} onChange={changeOutput} disabled={phase === "ending"} />
         ) : (
           <p className="text-sm text-slate-400">
@@ -294,11 +383,11 @@ export default function LiveLesson() {
         <button onClick={testSound} disabled={phase === "ending"} className="w-full rounded-lg bg-slate-800 p-3 text-sm">
           🔔 Testar som da caixa (toca um bipe)
         </button>
-        {IS_IOS && (
+        {IS_IOS && outputMode === "local" && (
           <p className="rounded-lg bg-amber-500/10 p-3 text-xs text-amber-200">
-            iPhone/iPad: com o microfone ligado, o iOS às vezes manda o som para o alto-falante do próprio aparelho em vez
-            do Bluetooth. Se o bipe sai na caixa/TV mas sua voz não, é essa limitação do iOS. Nesse caso use cabo
-            (adaptador P2) ou abra o TutorMic num notebook ou celular Android.
+            iPhone/iPad: com o microfone ligado, o iOS manda o som para o alto-falante do próprio aparelho em vez do
+            Bluetooth. Neste aparelho, só funciona com cabo (adaptador P2 até a caixa). Para usar Bluetooth, escolha
+            “Em outro aparelho”.
           </p>
         )}
         <details className="text-sm text-slate-400">

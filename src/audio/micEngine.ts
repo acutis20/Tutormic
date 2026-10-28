@@ -3,7 +3,8 @@ import { FeedbackGuard } from "./feedbackGuard";
 /**
  * Microfone ao vivo:
  *
- *   mic → passa-alta (~90 Hz) → compressor/limitador → mudo ─┬→ volume → saída (JBL etc.)
+ *   mic → passa-alta (~90 Hz) → compressor/limitador → mudo ─┬→ volume ─┬→ saída local (JBL etc.)
+ *                                                           │          └→ transmissão (modo receptor)
  *                                                           ├→ gravação
  *                                                           └→ analisador (medidor + anti-microfonia)
  */
@@ -26,6 +27,9 @@ export class MicEngine {
   private compressor!: DynamicsCompressorNode;
   private muteGain!: GainNode;
   private volumeGain!: GainNode;
+  private localOut!: GainNode;
+  private liveDest!: MediaStreamAudioDestinationNode;
+  private localEnabled = true;
   private analyser!: AnalyserNode;
   private recordDest!: MediaStreamAudioDestinationNode;
   private fallbackDest: MediaStreamAudioDestinationNode | null = null;
@@ -96,6 +100,21 @@ export class MicEngine {
     osc.stop(t + 0.65);
   }
 
+  /** Som final (com volume e mudo) para transmitir a outro aparelho no modo receptor. */
+  get liveStream(): MediaStream {
+    if (!this.graphReady) throw new Error("Microfone não iniciado");
+    return this.liveDest.stream;
+  }
+
+  /**
+   * Liga/desliga o som saindo NESTE aparelho. No modo receptor fica desligado: quem toca é o
+   * outro aparelho, e tocar aqui também causaria eco e microfonia.
+   */
+  setLocalOutput(enabled: boolean): void {
+    this.localEnabled = enabled;
+    if (this.graphReady && this.ctx) this.localOut.gain.setTargetAtTime(enabled ? 1 : 0, this.ctx.currentTime, 0.01);
+  }
+
   /** Stream processado para o MediaRecorder. */
   get recordingStream(): MediaStream {
     if (!this.graphReady) throw new Error("Microfone não iniciado");
@@ -121,7 +140,10 @@ export class MicEngine {
     this.recordDest = ctx.createMediaStreamDestination();
 
     this.highpass.connect(this.compressor).connect(this.muteGain);
-    this.muteGain.connect(this.volumeGain).connect(ctx.destination);
+    this.localOut = new GainNode(ctx, { gain: this.localEnabled ? 1 : 0 });
+    this.liveDest = ctx.createMediaStreamDestination();
+    this.muteGain.connect(this.volumeGain).connect(this.localOut).connect(ctx.destination);
+    this.volumeGain.connect(this.liveDest);
     this.muteGain.connect(this.recordDest);
     this.muteGain.connect(this.analyser);
 
@@ -176,8 +198,8 @@ export class MicEngine {
 
     if (!this.fallbackDest) {
       this.fallbackDest = this.ctx.createMediaStreamDestination();
-      this.volumeGain.disconnect(this.ctx.destination);
-      this.volumeGain.connect(this.fallbackDest);
+      this.localOut.disconnect(this.ctx.destination);
+      this.localOut.connect(this.fallbackDest);
       el.srcObject = this.fallbackDest.stream;
       el.autoplay = true;
       this.fallbackEl = el;
